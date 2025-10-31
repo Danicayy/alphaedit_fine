@@ -43,6 +43,7 @@ def main():
     aa("--precision", default="float32", choices=["float64", "float32", "float16"])
     aa("--stats_dir", default=STATS_DIR)
     aa("--download", default=1, type=int, choices=[0, 1])
+    aa("--sample_ratio", default=1.0, type=float)
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -70,6 +71,7 @@ def main():
             precision=args.precision,
             batch_tokens=args.batch_tokens,
             download=args.download,
+            sample_ratio=args.sample_ratio,
         )
 
 
@@ -87,13 +89,14 @@ def layer_stats(
     download=True,
     progress=tqdm,
     force_recompute=False,
-    hparams=None
+    hparams=None,
+    sample_ratio=1.0
 ):
     """
     Function to load or compute cached stats.
     """
 
-    def get_ds():
+    def get_ds(sample_ratio=1.0):
         # Load_From_File
         # from datasets import Dataset
         # raw_ds = Dataset.from_file('data/wikipedia-train.arrow')
@@ -102,6 +105,11 @@ def layer_stats(
             ds_name,
             dict(wikitext="wikitext-103-raw-v1", wikipedia="20200501.en")[ds_name]
         )
+        train_ds = raw_ds["train"]
+        if sample_ratio < 1.0:
+            train_ds = train_ds.shuffle(seed=42)
+            n = int(len(train_ds) * sample_ratio)
+            train_ds = train_ds.select(range(n))
         if hasattr(model.config, 'n_positions'):
             maxlen = model.config.n_positions
         elif hasattr(model.config, 'max_sequence_length'):
@@ -123,7 +131,7 @@ def layer_stats(
 
         if batch_tokens is not None and batch_tokens < maxlen:
             maxlen = batch_tokens
-        return TokenizedDataset(raw_ds["train"], tokenizer, maxlen=maxlen)
+        return TokenizedDataset(train_ds, tokenizer, maxlen=maxlen)
 
     # Continue with computation of statistics
     batch_size = 1  # Examine this many dataset texts at once
@@ -164,7 +172,7 @@ def layer_stats(
 
     print(f"Computing Cov locally....")
 
-    ds = get_ds() if not filename.exists() else None
+    ds = get_ds(sample_ratio=locals().get('sample_ratio', 1.0)) if not filename.exists() else None
     if progress is None:
         progress = lambda x: x
 

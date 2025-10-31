@@ -1,10 +1,11 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 import json
 import shutil
 from itertools import islice
 from time import time
-from typing import Tuple, Union
+from datetime import datetime
+from typing import Tuple, Union, Optional
 import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -62,14 +63,19 @@ def main(
     hparams_fname: str,
     ds_name: str,
     dataset_size_limit: int,
-    continue_from_run: str,
+    continue_from_run: Optional[str],
     skip_generation_tests: bool,
     generation_test_interval: int,
     conserve_memory: bool,
     dir_name: str,
     num_edits: int = 1,
     use_cache: bool = False,
+    save_weights: bool = False,
 ):
+    # 记录开始时间
+    start_time = datetime.now()
+    start_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
     # Set algorithm-specific variables
     params_class, apply_algo = ALG_DICT[alg_name]
 
@@ -94,6 +100,31 @@ def main(
         run_dir = RESULTS_DIR / dir_name / f"run_{str(run_id).zfill(3)}"
         run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Results will be stored at {run_dir}")
+    
+    # 保存运行参数和开始时间到 run_dir/run_args.json
+    run_args = {
+        "start_time": start_time_str,
+        "alg_name": alg_name,
+        "model_name_arg": model_name if isinstance(model_name, str) else "loaded_from_tuple",
+        "hparams_fname": hparams_fname,
+        "ds_name": ds_name,
+        "dataset_size_limit": dataset_size_limit,
+        "num_edits": num_edits,
+        "continue_from_run": continue_from_run,
+        "skip_generation_tests": skip_generation_tests,
+        "generation_test_interval": generation_test_interval,
+        "conserve_memory": conserve_memory,
+        "use_cache": use_cache,
+        "save_weights": save_weights,
+    }
+    
+    # 确保run_dir是Path对象
+    run_dir = Path(run_dir)
+    
+    # 将字典保存为 JSON 文件
+    with open(run_dir / "run_args.json", "w") as f:
+        json.dump(run_args, f, indent=4)
+    print(f"Run arguments and start time saved to {run_dir / 'run_args.json'}")
     if "MEMIT" in alg_name:
     # Get run hyperparameters
         params_path = (
@@ -115,7 +146,7 @@ def main(
     # Instantiate vanilla model
     if type(model_name) is str:
         print("Instantiating model")
-        model = AutoModelForCausalLM.from_pretrained(model_name).cuda()
+        model = AutoModelForCausalLM.from_pretrained(model_name, device_map='auto')
         tok = AutoTokenizer.from_pretrained(model_name)
         tok.pad_token = tok.eos_token
     else:
@@ -204,9 +235,26 @@ def main(
                 P = torch.zeros((len(hparams.layers), W_out.shape[1], W_out.shape[1]), device="cpu")
         del W_out
     if alg_name == "AlphaEdit":
-        for i, layer in enumerate(hparams.layers):
-            P[i,:,:] = get_project(model,tok,layer,hparams)
-        torch.save(P, "null_space_project.pt")
+        # 检查是否有现成的P矩阵可以加载
+        proj_path = "null_space_project_ratio0.5.pt"
+        if not os.path.exists(proj_path):
+            # 创建weights目录
+            weights_dir = Path(run_dir) / "weights"
+            weights_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 对每一层计算投影矩阵
+            for i, layer in enumerate(hparams.layers):
+                P[i,:,:] = get_project(model, tok, layer, hparams, run_dir, save_weights=True)
+                
+            # 保存整个P矩阵
+            torch.save(P, proj_path)
+            # 也保存到run_dir
+            torch.save(P, weights_dir / "all_layers_P.pt")
+            print(f"Saved complete projection matrix to {proj_path} and {weights_dir / 'all_layers_P.pt'}")
+        else:
+            # 加载已有的P矩阵
+            P = torch.load(proj_path)
+            print(f"Loaded projection matrix from {proj_path}")
     # hs = get_module_input_output_at_words(
     #         model,
     #         tok,
@@ -423,7 +471,16 @@ def main(
         #         nethook.get_parameter(model, k)[...] = v.to("cuda")
 
         print("Evaluation took", time() - start)
-def get_project(model, tok, layer, hparams):
+        
+    # 记录训练和评估结束时间
+    training_end_time = datetime.now()
+    evaluation_end_time = datetime.now()
+    
+    print(f"Training time cost: {training_end_time - start_time}")
+    print(f"Evaluation time cost: {evaluation_end_time - training_end_time}")
+    print(f"Total time cost: {evaluation_end_time - start_time}")
+    print(f"Results have been stored at {run_dir}")
+def get_project(model, tok, layer, hparams, run_dir, save_weights=False):
     force_recompute = False
     cov = get_cov(
         model,
@@ -436,11 +493,42 @@ def get_project(model, tok, layer, hparams):
         hparams.mom2_dtype,
         force_recompute=force_recompute,
     ).cpu()
+
+    # 保存 K0K0T (cov)
+    weights_dir = None
+    if save_weights:
+        weights_dir = Path(run_dir) / "weights"
+        weights_dir.mkdir(parents=True, exist_ok=True)
+        cov_save_path = weights_dir / f"layer_{layer:02d}_K0K0T.pt"
+        torch.save(cov, cov_save_path)
+        print(f"Saved K0K0T for layer {layer} to {cov_save_path}")
+
     U, S, _ = torch.linalg.svd(cov, full_matrices=False)
     threshold = hparams.nullspace_threshold
     small_singular_indices = (S < threshold).nonzero(as_tuple=True)[0]
-    print(len(small_singular_indices))
-    return U[:, small_singular_indices] @ U[:, small_singular_indices].T
+    print(f"Layer {layer}: Found {len(small_singular_indices)} singular values below threshold {threshold}")
+  
+    P_layer = U[:, small_singular_indices] @ U[:, small_singular_indices].T
+
+    # 计算和保存秩
+    rank_value = int(torch.linalg.matrix_rank(P_layer).item())
+    print(f"Layer {layer}: Projection matrix rank {rank_value}")
+
+    # 保存秩信息到文件
+    rank_log_path = Path(run_dir) / "P_ranks.txt"
+    if not rank_log_path.exists():
+        with open(rank_log_path, "w", encoding="utf-8") as f:
+            f.write("layer\trank\n")
+    with open(rank_log_path, "a", encoding="utf-8") as f:
+        f.write(f"{layer}\t{rank_value}\n")
+    
+    # 保存 P 矩阵
+    if save_weights and weights_dir is not None:
+        P_save_path = weights_dir / f"layer_{layer:02d}_P.pt"
+        torch.save(P_layer, P_save_path)
+        print(f"Saved P for layer {layer} to {P_save_path}")
+
+    return P_layer
 def window(seq, n=2):
     "Returns a sliding window (of width n) over data from the iterable"
     "   s -> (s0,s1,...s[n-1]), (s1,s2,...,sn), ...                   "
@@ -541,6 +629,11 @@ if __name__ == "__main__":
         default=0,
         help="If we want to do sequential editing or not",
     )
+    parser.add_argument(
+        "--save_weights",
+        action="store_true", 
+        help="Set this flag to save intermediate model weights."
+    )
     parser.set_defaults(skip_generation_tests=False, conserve_memory=False)
     args = parser.parse_args()
 
@@ -557,4 +650,5 @@ if __name__ == "__main__":
         dir_name=args.alg_name,
         num_edits=args.num_edits,
         use_cache=args.use_cache,
+        save_weights=False,  # 添加保存权重参数
     )
